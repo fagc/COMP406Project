@@ -1,0 +1,219 @@
+"""
+Created on Mon Nov  25 10:48:51 2024
+
+@author: franciscogarzon
+
+ARIMA MODEL
+
+
+"""
+
+# import necessary libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from statsmodels.tsa.stattools import adfuller
+from pmdarima import auto_arima
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# check if the 'dataset' directory exists; if not, create it
+if not os.path.exists("./dataset"):
+    os.makedirs("./dataset")
+
+# download dataset from kaggle if not already downloaded
+if not os.path.exists("./dataset/DatafinitiElectronicsProductsPricingData.csv"):
+    os.system("kaggle datasets download -d datafiniti/electronic-products-prices -p ./dataset --unzip")
+    print("dataset downloaded and extracted to './dataset' directory")
+
+# define dataset file path
+dataset_path = "./dataset/DatafinitiElectronicsProductsPricingData.csv"
+
+# read the csv file into a pandas dataframe
+data = pd.read_csv(dataset_path)
+
+# remove duplicate rows to ensure data quality
+data_clean = data.drop_duplicates()
+
+# select relevant columns for time series analysis
+data_relevant = data_clean[['prices.amountMin', 'prices.amountMax', 'prices.dateSeen',
+                            'prices.currency', 'categories']].copy()
+
+# define a function to extract the latest date from the 'prices.dateSeen' column
+def get_latest_date(date_str):
+    if pd.isnull(date_str):
+        return pd.NaT
+    date_list = date_str.strip(',').split(',')
+    dates = pd.to_datetime(date_list, errors='coerce')
+    return dates.max()
+
+# apply the function to the 'prices.dateSeen' column
+data_relevant['prices.dateSeen'] = data_relevant['prices.dateSeen'].apply(get_latest_date)
+
+# drop rows with missing dates
+data_relevant.dropna(subset=['prices.dateSeen'], inplace=True)
+
+# set 'prices.dateSeen' as the index for time series analysis
+data_relevant.set_index('prices.dateSeen', inplace=True)
+
+# filter data to only include prices in usd
+data_usd = data_relevant[data_relevant['prices.currency'] == 'USD']
+
+# calculate the average price from the minimum and maximum prices
+data_usd['average_price'] = (data_usd['prices.amountMin'] + data_usd['prices.amountMax']) / 2
+
+# drop rows with missing average price
+data_usd.dropna(subset=['average_price'], inplace=True)
+
+# simplify categories by taking the first category in the list
+def simplify_category(cat_str):
+    if pd.isnull(cat_str):
+        return 'Unknown'
+    return cat_str.split(' > ')[-1].strip()
+
+data_usd['simple_category'] = data_usd['categories'].apply(simplify_category)
+
+# group data by simplified categories
+category_counts = data_usd['simple_category'].value_counts()
+top_categories = category_counts.head(5).index.tolist()
+
+print("Top 5 categories by data points:")
+print(top_categories)
+
+# analyze and forecast for each top category
+results = []  # to store results for summary
+
+for category in top_categories:
+    print('Analyzing category')
+    category_data = data_usd[data_usd['simple_category'] == category]
+    
+    # resample data to weekly frequency and calculate mean average price
+    category_weekly_price = category_data['average_price'].resample('W').mean()
+    
+    # check if there is enough data
+    if len(category_weekly_price.dropna()) < 20:
+        print(f"Not enough data for category: {category}")
+        continue
+    
+    # forward-fill missing values
+    category_weekly_price.fillna(method='ffill', inplace=True)
+    
+    # plot the weekly average prices over time
+    plt.figure(figsize=(10, 5))
+    plt.plot(category_weekly_price, label='Weekly Average Price')
+    plt.title('Weekly Average Prices')
+    plt.xlabel('Date')
+    plt.ylabel('Average Price (USD)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # perform the augmented dickey-fuller test to check for stationarity
+    adf_result = adfuller(category_weekly_price)
+    print(f"ADF Statistic: {adf_result[0]:.2f}")
+    print(f"p-value: {adf_result[1]:.4f}")
+    
+    # determine if differencing is needed based on the p-value
+    if adf_result[1] > 0.05:
+        print("Time series is not stationary. Applying differencing.")
+        category_weekly_price_diff = category_weekly_price.diff().dropna()
+    else:
+        print("Time series is stationary. No differencing needed.")
+        category_weekly_price_diff = category_weekly_price
+    
+    # split the data into train (70%), validation (15%), and test (15%) sets
+    total_data_points = len(category_weekly_price_diff)
+    train_size = int(total_data_points * 0.7)
+    val_size = int(total_data_points * 0.15)
+    
+    train_data = category_weekly_price_diff.iloc[:train_size]
+    val_data = category_weekly_price_diff.iloc[train_size:train_size+val_size]
+    test_data = category_weekly_price_diff.iloc[train_size+val_size:]
+    
+    # use auto_arima to find the best arima model parameters on training data
+    model = auto_arima(
+        train_data,
+        seasonal=False,
+        error_action='ignore',
+        suppress_warnings=True,
+        stepwise=True,
+    )
+    
+    # retrain the model on combined train and validation data
+    combined_train_val_data = pd.concat([train_data, val_data])
+    model.fit(combined_train_val_data)
+    
+    # forecast the next periods equal to the length of the test data
+    forecast_period = len(test_data)
+    forecast = model.predict(n_periods=forecast_period)
+    forecast_index = test_data.index
+    forecast_series = pd.Series(forecast, index=forecast_index)
+    
+    # compute errors
+    mae = mean_absolute_error(test_data, forecast_series)
+    mse = mean_squared_error(test_data, forecast_series)
+    rmse = np.sqrt(mse)
+    print(f"Mean Absolute Error (MAE): {mae:.2f}")
+    print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+    
+    # store results for summary
+    results.append({
+        'Category': category,
+        'MAE': mae,
+        'RMSE': rmse,
+        'Model_Order': model.order
+    })
+    
+    # plot actual vs forecasted prices
+    plt.figure(figsize=(10, 5))
+    plt.plot(combined_train_val_data, label='Training Data')
+    plt.plot(test_data, label='Actual Prices')
+    plt.plot(forecast_series, label='Forecasted Prices', color='red')
+    plt.title('ARIMA Forecast vs Actual')
+    plt.xlabel('Date')
+    plt.ylabel('Average Price (USD)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # forecast future prices for the next 12 weeks (3 months)
+    future_forecast_period = 12
+    future_forecast = model.predict(n_periods=future_forecast_period)
+    future_forecast_index = pd.date_range(start=category_weekly_price.index[-1] + pd.Timedelta(weeks=1),
+                                          periods=future_forecast_period, freq='W')
+    future_forecast_series = pd.Series(future_forecast, index=future_forecast_index)
+    
+    # plot the historical data and future forecast
+    plt.figure(figsize=(10, 5))
+    plt.plot(category_weekly_price_diff, label='Historical Prices')
+    plt.plot(future_forecast_series, label='Future Forecast', color='green')
+    plt.title('Future Price Forecast')
+    plt.xlabel('Date')
+    plt.ylabel('Average Price (USD)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # provide pricing recommendations based on forecast
+    future_mean = future_forecast_series.mean()
+    historical_mean = category_weekly_price_diff.mean()
+    if future_mean > historical_mean:
+        recommendation = "Prices are expected to increase. Consider increasing inventory levels and postponing discounts."
+    else:
+        recommendation = "Prices are expected to decrease. Consider promoting sales and scheduling discounts in advance."
+    print("Pricing Recommendation:")
+    print(recommendation)
+    
+    # store recommendation
+    results[-1]['Recommendation'] = recommendation
+
+# create a summary dataframe
+results_df = pd.DataFrame(results)
+print("\nSummary of Results:")
+print(results_df[['Category', 'MAE', 'RMSE', 'Model_Order', 'Recommendation']])
+
+# display summary in the report-friendly format
+print("\nAnalysis completed.")
